@@ -17,7 +17,7 @@ echo "[1/4] 编译构建 ..."
 ./build.sh
 
 echo "[2/4] 打包 zip ..."
-ZIP="金铲铲修复工具-$VER.zip"
+ZIP="JKChessFixTool-$VER.zip"
 rm -f "$ZIP"
 ditto -c -k --keepParent "金铲铲修复工具.app" "$ZIP"
 

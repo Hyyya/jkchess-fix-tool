@@ -1,6 +1,18 @@
 import SwiftUI
 import AppKit
 
+// 调试日志（诊断更新流程）
+func dlog(_ s: String) {
+    let line = "\(Date()) \(s)\n"
+    let path = "/tmp/updater.log"
+    if let h = FileHandle(forWritingAtPath: path) {
+        h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); h.closeFile()
+    } else {
+        try? line.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
+
 // ============================================================
 //  金铲铲之战 · 独立修复工具
 //  专门用于解决金铲铲(com.tencent.jkchess)在 PlayCover 下的
@@ -15,6 +27,18 @@ struct ReleaseInfo {
     let zipURL: URL
 }
 
+// 统一弹窗（避免多个 .alert 叠加串扰）
+enum UpdateDialog: Identifiable {
+    case update(ReleaseInfo)
+    case message(String)
+    var id: String {
+        switch self {
+        case .update(let r): return "update-\(r.version)"
+        case .message(let s): return "msg-\(s.prefix(20))"
+        }
+    }
+}
+
 class Updater: NSObject, ObservableObject {
     // GitHub 仓库（owner 在创建仓库后填入）
     static let owner = "Hyyya"
@@ -22,10 +46,7 @@ class Updater: NSObject, ObservableObject {
 
     @Published var checking = false
     @Published var working = false
-    @Published var release: ReleaseInfo?
-    @Published var showUpdate = false
-    @Published var showNoUpdate = false
-    @Published var showError = false
+    @Published var dialog: UpdateDialog?
     @Published var statusText = ""
 
     var currentVersion: String {
@@ -33,9 +54,10 @@ class Updater: NSObject, ObservableObject {
     }
 
     func check(silent: Bool) {
-        guard !checking, !working else { return }
+        dlog("check 开始 silent=\(silent) checking=\(checking) working=\(working) owner=\(Updater.owner)")
+        guard !checking, !working else { dlog("check 被guard拦截，直接返回"); return }
         if Updater.owner == "__OWNER__" {
-            if !silent { statusText = "更新源尚未配置（GitHub 仓库 owner 为空）。"; showError = true }
+            if !silent { dialog = .message("更新源尚未配置（GitHub 仓库 owner 为空）。") }
             return
         }
         checking = true
@@ -43,14 +65,16 @@ class Updater: NSObject, ObservableObject {
         var req = URLRequest(url: URL(string: api)!)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.timeoutInterval = 20
-        URLSession.shared.dataTask(with: req) { data, _, err in
+        dlog("发起请求: \(api)")
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            dlog("收到响应 data长度=\(data?.count ?? -1) err=\(err?.localizedDescription ?? "无") http=\((resp as? HTTPURLResponse)?.statusCode ?? -1)")
             DispatchQueue.main.async {
                 self.checking = false
                 guard let data = data,
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    dlog("JSON解析失败，silent=\(silent)")
                     if !silent {
-                        self.statusText = "检查更新失败：无法连接 GitHub（网络问题）。\n\(err?.localizedDescription ?? "")"
-                        self.showError = true
+                        self.dialog = .message("检查更新失败：无法连接 GitHub（网络问题）。\n\(err?.localizedDescription ?? "")")
                     }
                     return
                 }
@@ -68,15 +92,17 @@ class Updater: NSObject, ObservableObject {
                         }
                     }
                 }
+                dlog("解析: tag=\(tag) ver=\(ver) zipURL=\(zipURL?.absoluteString ?? "无") 当前版本=\(self.currentVersion)")
                 guard let zu = zipURL else {
-                    if !silent { self.statusText = "最新 Release 中未找到 .zip 安装包。"; self.showError = true }
+                    if !silent { self.dialog = .message("最新 Release 中未找到 .zip 安装包。") }
                     return
                 }
                 if self.isNewer(ver, than: self.currentVersion) {
-                    self.release = ReleaseInfo(version: ver, notes: notes, zipURL: zu)
-                    self.showUpdate = true
-                } else if !silent {
-                    self.showNoUpdate = true
+                    dlog("判定：有新版本，弹出更新窗")
+                    self.dialog = .update(ReleaseInfo(version: ver, notes: notes, zipURL: zu))
+                } else {
+                    dlog("判定：无新版本，silent=\(silent)")
+                    if !silent { self.dialog = .message("已是最新版本，当前 v\(self.currentVersion)。") }
                 }
             }
         }.resume()
@@ -96,14 +122,16 @@ class Updater: NSObject, ObservableObject {
     }
 
     func performUpdate() {
-        guard let rel = release, !working else { return }
+        guard case .update(let rel) = dialog, !working else { dlog("performUpdate 被拦截 dialog=\(String(describing: dialog)) working=\(working)"); return }
         working = true
+        dlog("performUpdate 开始，目标版本 v\(rel.version)")
         statusText = "正在下载新版本 v\(rel.version)…"
         URLSession.shared.downloadTask(with: rel.zipURL) { tmp, _, err in
             let fail: (String) -> Void = { msg in
-                DispatchQueue.main.async { self.working = false; self.statusText = msg; self.showError = true }
+                DispatchQueue.main.async { self.working = false; self.dialog = .message(msg) }
             }
             guard let tmp = tmp, err == nil else { fail("下载失败：\(err?.localizedDescription ?? "未知错误")"); return }
+            dlog("下载完成: \(tmp.path)")
             let work = URL(fileURLWithPath: "/tmp/jkchess-update")
             try? FileManager.default.removeItem(at: work)
             try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
@@ -117,16 +145,27 @@ class Updater: NSObject, ObservableObject {
             p.waitUntilExit()
 
             guard let newApp = self.findApp(in: work) else { fail("解压后未找到新版 App。"); return }
+            dlog("解压找到新App: \(newApp.path)")
             let target = Bundle.main.bundlePath
+            let oldPID = ProcessInfo.processInfo.processIdentifier
 
             let script = """
             #!/bin/bash
+            OLDPID=\(oldPID)
             TARGET="\(target)"
             NEW="\(newApp.path)"
+            # 1) 等待旧进程完全退出（最多约30秒）
+            for i in $(seq 1 60); do
+              if ! kill -0 "$OLDPID" 2>/dev/null; then break; fi
+              sleep 0.5
+            done
+            sleep 1
+            # 2) 删除旧版本
             for i in $(seq 1 20); do
               if rm -rf "$TARGET"; then break; fi
               sleep 1
             done
+            # 3) 拷贝新版本并启动
             cp -R "$NEW" "$TARGET"
             open "$TARGET"
             rm -rf "/tmp/jkchess-update"
@@ -137,6 +176,7 @@ class Updater: NSObject, ObservableObject {
             q.executableURL = URL(fileURLWithPath: "/bin/bash")
             q.arguments = ["-c", "nohup /bin/bash \(scriptPath) >/tmp/jkchess-swap.log 2>&1 &"]
             do { try q.run() } catch { fail("启动更新脚本失败。"); return }
+            dlog("已启动替换脚本，0.8秒后退出当前进程 pid=\(oldPID)")
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                 NSApp.terminate(nil)
@@ -209,7 +249,7 @@ struct StatusRow: Identifiable {
 }
 
 struct ContentView: View {
-    @State private var updater = Updater()
+    @StateObject private var updater = Updater()
 
     @State private var status: [StatusRow] = [
         StatusRow(key: "安装状态", value: "读取中…", good: nil),
@@ -264,32 +304,40 @@ struct ContentView: View {
             refreshStatus()
             updater.check(silent: true)
         }
-        // 发现新版本
-        .alert("发现新版本 v\(updater.release?.version ?? "")",
-               isPresented: $updater.showUpdate,
-               presenting: updater.release) { rel in
-            Button("立即更新") { updater.performUpdate() }
-            Button("稍后", role: .cancel) {}
-        } message: { rel in
-            Text(rel.notes.isEmpty ? "是否立即下载并更新？" : rel.notes)
+        // 统一弹窗（更新确认 / 各类提示）
+        .alert(item: $updater.dialog) { dlg in
+            switch dlg {
+            case .update(let rel):
+                return Alert(
+                    title: Text("发现新版本 v\(rel.version)"),
+                    message: Text(rel.notes.isEmpty ? "是否立即下载并更新？" : rel.notes),
+                    primaryButton: .default(Text("立即更新")) { updater.performUpdate() },
+                    secondaryButton: .cancel(Text("稍后"))
+                )
+            case .message(let s):
+                return Alert(
+                    title: Text("更新提示"),
+                    message: Text(s),
+                    dismissButton: .cancel(Text("好"))
+                )
+            }
         }
-        // 已是最新
-        .alert("已是最新版本", isPresented: $updater.showNoUpdate) {
-            Button("好", role: .cancel) {}
-        } message: {
-            Text("当前版本 v\(updater.currentVersion)，无需更新。")
-        }
-        // 错误提示
-        .alert("更新提示", isPresented: $updater.showError) {
-            Button("知道了", role: .cancel) {}
-        } message: {
-            Text(updater.statusText)
-        }
-        // 下载/安装进度
-        .alert("正在更新", isPresented: $updater.working) {
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text(updater.statusText + "\n请勿关闭程序，更新完成后将自动重启。")
+        // 下载/安装进度遮罩（独立于弹窗，避免叠加串扰）
+        .overlay {
+            if updater.working {
+                ZStack {
+                    Color.black.opacity(0.25).ignoresSafeArea()
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text(updater.statusText)
+                            .font(.caption).multilineTextAlignment(.center)
+                        Text("更新完成后将自动重启，请勿关闭")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                    .padding(22)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
         }
     }
 
